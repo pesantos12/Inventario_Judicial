@@ -1,247 +1,175 @@
 'use client'
 
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import Navbar from '@/components/Navbar'
 import Card from '@/components/Card'
 import Selo from '@/components/Selo'
-import SemProcesso from '@/components/SemProcesso'
-import { Alerta, BotaoPrimario, BotaoSecundario, Selecao } from '@/components/Campo'
-import { useSessao } from '@/components/SessaoProvider'
-import { useDados } from '@/lib/useDados'
-import { catalogo as apiCatalogo, documentos as apiDocumentos } from '@/lib/api'
-import { formatarDataHora, formatarTamanho } from '@/lib/formatadores'
+import CasoGuard from '@/components/CasoGuard'
+import { api } from '@/lib/cliente'
+import { DOC_TIPOS } from '@/lib/catalogo'
+import { MENSAGENS, perfilPode } from '@/lib/estados'
+
+const LEITURAS = {
+  legivel: 'Legível, dados coerentes com o formulário',
+  baixa_legibilidade: 'Imagem desfocada / baixa legibilidade',
+  cpf_divergente: 'CPF do documento diverge do formulário',
+  conteudo_outro: 'Conteúdo é de outro tipo de documento',
+  documento_terceiro: 'Documento de terceiro (quarentena)',
+}
+
+const kb = (n) => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`)
+
+function Upload({ caso, recarregar, user }) {
+  const [tipo, setTipo] = useState('certidao_obito')
+  const [leitura, setLeitura] = useState('legivel')
+  const [msg, setMsg] = useState(null)
+  const [enviando, setEnviando] = useState(false)
+  const arq = useRef(null)
+
+  useEffect(() => { const t = new URLSearchParams(window.location.search).get('tipo'); if (t && DOC_TIPOS[t]) setTipo(t) }, [])
+
+  const enviar = async (e) => {
+    e.preventDefault()
+    const file = arq.current?.files?.[0]
+    if (!file) return setMsg({ tipo: 'erro', texto: 'Escolha um arquivo (PDF, PNG ou JPG, até 10 MB).' })
+    setEnviando(true); setMsg(null)
+    const form = new FormData(); form.set('file', file); form.set('tipo', tipo)
+    try {
+      const r = await api(`/cases/${caso.id}/documents`, { method: 'POST', form })
+      try {
+        await api(`/cases/${caso.id}/documents/${r.documento.id}/extract`, { method: 'POST', body: { leitura } })
+        setMsg({ tipo: 'ok', texto: 'Arquivo enviado e lido (leitura simulada). Confira o resultado abaixo.' })
+      } catch (e2) {
+        setMsg({ tipo: e2.status === 503 ? 'aviso' : 'erro', texto: e2.status === 503 ? e2.message : `Arquivo enviado, mas a leitura falhou: ${e2.message}` })
+      }
+      arq.current.value = ''
+    } catch (e2) {
+      setMsg({ tipo: 'erro', texto: e2.dados?.mensagem || e2.message })
+    }
+    setEnviando(false); recarregar()
+  }
+
+  const cor = { ok: 'text-selo-success', erro: 'text-selo-danger', aviso: 'text-selo-warning' }
+  return (
+    <Card eyebrow="Novo arquivo" title="Enviar documento">
+      <form onSubmit={enviar} className="grid gap-4 sm:grid-cols-2">
+        <div>
+          <label htmlFor="tipo" className="mb-1.5 block text-sm font-medium text-ink">Tipo de documento</label>
+          <select id="tipo" value={tipo} onChange={(e) => setTipo(e.target.value)} className="w-full rounded-sm border border-ink/15 bg-white px-2 py-2 text-sm">
+            {Object.entries(DOC_TIPOS).map(([k, r]) => (<option key={k} value={k}>{r}</option>))}
+          </select>
+        </div>
+        <div>
+          <label htmlFor="arq" className="mb-1.5 block text-sm font-medium text-ink">Arquivo (PDF, PNG ou JPG · até 10 MB)</label>
+          <input id="arq" ref={arq} type="file" accept=".pdf,.png,.jpg,.jpeg" className="w-full text-sm" />
+        </div>
+        <div className="sm:col-span-2 rounded-sm border border-dashed border-slate/50 p-3">
+          <label htmlFor="leitura" className="mb-1.5 block text-sm font-medium text-ink">Resultado da leitura simulada <Selo estado="CLASSIFICADO" texto="Apenas para teste" simulado /></label>
+          <select id="leitura" value={leitura} onChange={(e) => setLeitura(e.target.value)} className="w-full rounded-sm border border-ink/15 bg-white px-2 py-2 text-sm">
+            {Object.entries(LEITURAS).map(([k, r]) => (<option key={k} value={k}>{r}</option>))}
+          </select>
+          <p className="mt-1 text-xs text-slate">O protótipo não lê o conteúdo do arquivo: este controle reproduz cenários do caderno de casos. Em produção, a leitura seria feita pelo módulo de IA.</p>
+        </div>
+        <div className="sm:col-span-2 flex items-center gap-3">
+          <button disabled={enviando || !perfilPode(user.perfil, 'anexar')} className="rounded-sm bg-ink px-4 py-2.5 text-sm font-medium text-parchment hover:bg-ink-soft disabled:opacity-50">{enviando ? 'Enviando…' : 'Enviar e ler'}</button>
+          {msg && <p role={msg.tipo === 'erro' ? 'alert' : 'status'} className={`text-sm ${cor[msg.tipo]}`}>{msg.texto}</p>}
+        </div>
+      </form>
+    </Card>
+  )
+}
+
+function Linha({ d, caso, user, recarregar }) {
+  const [aberto, setAberto] = useState(false)
+  const [motivo, setMotivo] = useState('')
+  const [erro, setErro] = useState('')
+  const decidir = async (estado) => {
+    setErro('')
+    try { await api(`/cases/${caso.id}/documents/${d.id}`, { method: 'PATCH', body: { version: caso.version, estado, motivo } }); setAberto(false); setMotivo(''); recarregar() }
+    catch (e) { setErro(e.message); if (e.status === 409) recarregar() }
+  }
+  const relerAgora = async () => {
+    setErro('')
+    try { await api(`/cases/${caso.id}/documents/${d.id}/extract`, { method: 'POST', body: { leitura: 'legivel' } }); recarregar() } catch (e) { setErro(e.message) }
+  }
+  const tipoDiverge = d.tipo_classificado && d.tipo_classificado !== d.tipo
+  const decidivel = ['CLASSIFICADO', 'DIVERGENTE', 'EM_ANALISE', 'REVISADO'].includes(d.status)
+
+  return (
+    <li className="py-4 first:pt-0 last:pb-0">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <p className="text-sm font-medium text-ink">{d.nome}</p>
+          <p className="text-xs text-slate">{DOC_TIPOS[d.tipo] || d.tipo}{d.tamanho ? ` · ${kb(d.tamanho)}` : ''}{d.hash && !d.hash.startsWith('simulado') ? ` · sha256 ${d.hash.slice(0, 10)}…` : ''}</p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          {d.quarentena && <Selo estado="EM_ANALISE" texto="Quarentena" />}
+          <Selo estado={d.status} simulado={!!d.simulado && d.status !== 'ANEXADO' && d.status !== 'FALHA_TECNICA'} />
+        </div>
+      </div>
+
+      {d.status === 'FALHA_TECNICA' && <p className="mt-2 text-xs text-selo-danger">{d.motivo_tecnico} Envie um novo arquivo; este registro permanece no histórico.</p>}
+      {d.status === 'DIVERGENTE' && <p className="mt-2 text-xs text-selo-danger">{MENSAGENS.B}</p>}
+      {d.legibilidade === 'baixa' && <p className="mt-2 text-xs text-selo-warning">Baixa legibilidade (confiança {Math.round((d.confianca || 0) * 100)}%): nenhum dado foi confirmado. Envie um arquivo mais nítido.</p>}
+      {d.quarentena && <p className="mt-2 text-xs text-selo-warning">Possível documento de terceiro. Ele não é usado no caso até decisão do advogado.</p>}
+      {tipoDiverge && <p className="mt-2 text-xs text-selo-warning">O conteúdo parece ser “{DOC_TIPOS[d.tipo_classificado] || d.tipo_classificado}”, não “{DOC_TIPOS[d.tipo] || d.tipo}”. A classificação segue o conteúdo; confira o arquivo.</p>}
+
+      {d.entidades?.length > 0 && d.legibilidade !== 'baixa' && (
+        <dl className="mt-2 flex flex-wrap gap-x-6 gap-y-1 text-xs">
+          {d.entidades.map((e) => (<div key={e.campo}><dt className="inline text-slate">{e.campo}: </dt><dd className="inline font-mono text-ink">{e.valor}</dd> <span className="text-slate">({Math.round(e.confianca * 100)}%)</span></div>))}
+        </dl>
+      )}
+      {d.simulado && d.status !== 'ANEXADO' && d.status !== 'FALHA_TECNICA' && <p className="mt-1 text-[11px] text-slate">{MENSAGENS.D}</p>}
+      {d.estado_info?.reason && <p className="mt-1 text-[11px] text-slate">Último registro: {d.estado_info.reason} ({d.estado_info.actor_id})</p>}
+
+      <div className="mt-3 flex flex-wrap gap-2">
+        {d.status === 'ANEXADO' && perfilPode(user.perfil, 'anexar') && <button onClick={relerAgora} className="rounded-sm border border-ink/20 px-3 py-1.5 text-xs hover:bg-ink/5">Tentar leitura (simulada)</button>}
+        {decidivel && perfilPode(user.perfil, 'aceitar_documento') && <button onClick={() => setAberto(true)} className="rounded-sm border border-ink/20 px-3 py-1.5 text-xs hover:bg-ink/5">Registrar decisão do advogado</button>}
+      </div>
+      {aberto && (
+        <div className="mt-3 space-y-2 rounded-sm border border-ink/15 bg-white/70 p-3">
+          <label htmlFor={`m-${d.id}`} className="block text-sm font-medium text-ink">Motivo da decisão</label>
+          <p className="text-xs text-slate">“Aceito para organização” significa apenas que o arquivo será usado na organização do caso, não que o documento seja juridicamente válido.</p>
+          <textarea id={`m-${d.id}`} rows={2} value={motivo} onChange={(e) => setMotivo(e.target.value)} className="w-full rounded-sm border border-ink/15 bg-white px-3 py-2 text-sm" />
+          <div className="flex flex-wrap gap-2">
+            <button disabled={motivo.trim().length < 3} onClick={() => decidir('REVISADO')} className="rounded-sm bg-ink px-3 py-1.5 text-sm text-parchment disabled:opacity-50">Marcar como revisado</button>
+            <button disabled={motivo.trim().length < 3} onClick={() => decidir('ACEITO_PARA_ORGANIZACAO')} className="rounded-sm border border-ink/20 px-3 py-1.5 text-sm disabled:opacity-50">Aceitar para organização</button>
+            <button onClick={() => setAberto(false)} className="rounded-sm border border-ink/20 px-3 py-1.5 text-sm">Cancelar</button>
+          </div>
+        </div>
+      )}
+      {erro && <p role="alert" className="mt-2 text-xs text-selo-danger">{erro}</p>}
+    </li>
+  )
+}
+
+function Conteudo({ caso, user, recarregar }) {
+  const docs = [...caso.documentos].reverse()
+  return (
+    <>
+      <div className="flex flex-wrap items-end justify-between gap-4">
+        <div>
+          <p className="font-mono text-xs uppercase tracking-widest text-bronze-dark">Documentação · {caso.id}</p>
+          <h1 className="mt-1 font-display text-3xl font-semibold text-ink">Gerenciamento de documentos</h1>
+        </div>
+        <Link href="/documentos/checklist" className="rounded-sm border border-ink/15 px-4 py-2.5 text-sm font-medium text-ink hover:bg-ink/5">Ver checklist</Link>
+      </div>
+      <div className="mt-6"><Upload caso={caso} recarregar={recarregar} user={user} /></div>
+      <h2 className="mb-4 mt-10 font-display text-xl font-semibold text-ink">Arquivos do caso ({docs.length})</h2>
+      <Card>
+        {docs.length === 0 ? <p className="text-sm text-slate">Nenhum documento anexado ainda.</p> : <ul className="divide-y divide-ink/10">{docs.map((d) => <Linha key={d.id} d={d} caso={caso} user={user} recarregar={recarregar} />)}</ul>}
+      </Card>
+      <p className="mt-4 text-xs text-slate">Arquivos não são excluídos: falhas e substituições ficam no histórico. Não há varredura de vírus no protótipo (funcionalidade planejada).</p>
+    </>
+  )
+}
 
 export default function Documentos() {
-  const { processoId, processo, carregando: carregandoSessao } = useSessao()
-  const { dados: lista, erro, recarregar } = useDados(
-    () => (processoId ? apiDocumentos.listar(processoId) : Promise.resolve([])),
-    [processoId]
-  )
-  const { dados: tipos } = useDados(() => apiCatalogo.documentos(), [])
-
-  const [mostrarEnvio, setMostrarEnvio] = useState(false)
-  const [tipo, setTipo] = useState('certidao_obito')
-  const [arquivo, setArquivo] = useState(null)
-  const [mensagem, setMensagem] = useState(null)
-  const [erroAcao, setErroAcao] = useState(null)
-  const [ocupado, setOcupado] = useState(false)
-  const [selecionado, setSelecionado] = useState(null)
-
-  async function executar(acao, sucesso) {
-    setOcupado(true)
-    setErroAcao(null)
-    setMensagem(null)
-    try {
-      await acao()
-      if (sucesso) setMensagem(sucesso)
-      await recarregar()
-      setTimeout(recarregar, 2000)
-    } catch (e) {
-      setErroAcao(e.message)
-    } finally {
-      setOcupado(false)
-    }
-  }
-
-  async function enviar(e) {
-    e.preventDefault()
-    if (!arquivo) {
-      setErroAcao('Selecione um arquivo PDF.')
-      return
-    }
-    await executar(async () => {
-      await apiDocumentos.enviar(processoId, tipo, arquivo)
-      setArquivo(null)
-      setMostrarEnvio(false)
-    }, 'Documento recebido. O processamento roda em segundo plano e a tabela é atualizada em instantes.')
-  }
-
-  async function verDetalhe(doc) {
-    try {
-      const detalhe = await apiDocumentos.obter(processoId, doc.id)
-      setSelecionado(detalhe)
-    } catch (e) {
-      setErroAcao(e.message)
-    }
-  }
-
-  const opcoesTipo = (tipos || []).map((t) => ({ valor: t.tipo, rotulo: t.nome }))
-
   return (
     <div className="min-h-screen">
       <Navbar />
-      <main className="mx-auto max-w-5xl px-6 py-10">
-        <div className="flex flex-wrap items-end justify-between gap-4">
-          <div>
-            <p className="font-mono text-xs uppercase tracking-widest text-bronze-dark">Documentação</p>
-            <h1 className="mt-1 font-display text-3xl font-semibold text-ink">Gerenciamento de Documentos</h1>
-          </div>
-          {processoId && (
-            <div className="flex flex-wrap gap-3">
-              <Link href="/documentos/checklist" className="rounded-sm border border-ink/15 px-4 py-2.5 text-sm font-medium text-ink hover:bg-ink/5">
-                Ver checklist
-              </Link>
-              <BotaoSecundario
-                disabled={ocupado || !processo || processo.status === 'bloqueado'}
-                title={processo && processo.status === 'bloqueado' ? 'Disponível após a validação da certidão de óbito' : ''}
-                onClick={() => executar(() => apiDocumentos.buscaAutomatica(processoId), 'Busca automática de certidões negativas executada.')}
-              >
-                Buscar certidões negativas
-              </BotaoSecundario>
-              <button
-                type="button"
-                onClick={() => setMostrarEnvio((v) => !v)}
-                className="rounded-sm bg-ink px-4 py-2.5 text-sm font-medium text-parchment hover:bg-ink-soft"
-              >
-                + Enviar documento
-              </button>
-            </div>
-          )}
-        </div>
-
-        {!carregandoSessao && !processoId && <SemProcesso />}
-
-        <div className="mt-6 space-y-3">
-          <Alerta mensagem={erro || erroAcao} />
-          <Alerta mensagem={mensagem} tipo="sucesso" />
-        </div>
-
-        {mostrarEnvio && processoId && (
-          <Card className="mt-6" eyebrow="Upload assistido" title="Enviar documento">
-            <form onSubmit={enviar} className="grid gap-5 sm:grid-cols-[1fr_1fr_auto] sm:items-end">
-              <Selecao label="Tipo documental" valor={tipo} aoMudar={setTipo} opcoes={opcoesTipo} />
-              <div>
-                <label className="mb-1.5 block text-sm font-medium text-ink">Arquivo PDF</label>
-                <input
-                  type="file"
-                  accept="application/pdf"
-                  onChange={(e) => setArquivo(e.target.files[0] || null)}
-                  className="block w-full text-sm text-slate file:mr-3 file:rounded-sm file:border file:border-ink/15 file:bg-white file:px-3 file:py-2 file:text-sm file:text-ink"
-                />
-              </div>
-              <BotaoPrimario carregando={ocupado}>{ocupado ? 'Enviando…' : 'Enviar'}</BotaoPrimario>
-            </form>
-            {tipos && (
-              <p className="mt-4 text-xs text-slate">{(tipos.find((t) => t.tipo === tipo) || {}).tutorial}</p>
-            )}
-          </Card>
-        )}
-
-        {processoId && (
-          <Card className="mt-8" title="Arquivos enviados" action={<button type="button" onClick={recarregar} className="text-xs text-bronze-dark hover:underline">Atualizar</button>}>
-            {!lista || lista.length === 0 ? (
-              <p className="text-sm text-slate">Nenhum documento enviado até o momento.</p>
-            ) : (
-              <div className="overflow-x-auto">
-                <table className="w-full text-left text-sm">
-                  <thead>
-                    <tr className="border-b border-ink/10 text-xs uppercase tracking-wide text-slate">
-                      <th className="py-2 pr-4 font-medium">Arquivo</th>
-                      <th className="py-2 pr-4 font-medium">Categoria</th>
-                      <th className="py-2 pr-4 font-medium">Tamanho</th>
-                      <th className="py-2 pr-4 font-medium">Enviado em</th>
-                      <th className="py-2 pr-4 font-medium">Situação</th>
-                      <th className="py-2 pr-4 font-medium"></th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {lista.map((doc) => (
-                      <tr key={doc.id} className="border-b border-ink/5 last:border-0">
-                        <td className="py-3 pr-4">
-                          <button type="button" onClick={() => verDetalhe(doc)} className="text-left text-ink hover:underline">
-                            {doc.nome_arquivo}
-                          </button>
-                          <p className="text-xs text-slate">
-                            {doc.tipo_nome}
-                            {doc.origem === 'busca_automatica' ? ' · busca automática' : ''}
-                          </p>
-                        </td>
-                        <td className="py-3 pr-4 text-slate">{doc.categoria}</td>
-                        <td className="py-3 pr-4 font-mono text-xs text-slate">{formatarTamanho(doc.tamanho_bytes)}</td>
-                        <td className="py-3 pr-4 text-slate">{formatarDataHora(doc.recebido_em)}</td>
-                        <td className="py-3 pr-4">
-                          <Selo status={doc.status_validacao} />
-                        </td>
-                        <td className="py-3 pr-4 text-right text-xs">
-                          <button type="button" onClick={() => apiDocumentos.baixar(processoId, doc.id, doc.nome_arquivo).catch((e) => setErroAcao(e.message))} className="text-bronze-dark hover:underline">
-                            abrir
-                          </button>
-                          <span className="text-slate"> · </span>
-                          <button type="button" disabled={ocupado} onClick={() => executar(() => apiDocumentos.reprocessar(processoId, doc.id), 'Documento reprocessado.')} className="text-bronze-dark hover:underline">
-                            reprocessar
-                          </button>
-                          <span className="text-slate"> · </span>
-                          <button
-                            type="button"
-                            disabled={ocupado}
-                            onClick={() => {
-                              if (window.confirm(`Excluir ${doc.nome_arquivo}?`)) executar(() => apiDocumentos.remover(processoId, doc.id), 'Documento excluído.')
-                            }}
-                            className="text-selo-danger hover:underline"
-                          >
-                            excluir
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </Card>
-        )}
-
-        {selecionado && (
-          <Card
-            className="mt-6"
-            eyebrow={selecionado.tipo_nome}
-            title={selecionado.nome_arquivo}
-            action={
-              <button type="button" onClick={() => setSelecionado(null)} className="text-xs text-slate hover:text-ink">
-                fechar
-              </button>
-            }
-          >
-            <div className="grid gap-6 md:grid-cols-2">
-              <div className="space-y-2 text-sm">
-                <div className="flex items-center gap-3">
-                  <Selo status={selecionado.status_validacao} />
-                  {selecionado.metodo_extracao && <span className="font-mono text-xs text-slate">extração: {selecionado.metodo_extracao}</span>}
-                </div>
-                <p className="text-slate">{selecionado.motivo_status || selecionado.erro_processamento || 'Aguardando processamento.'}</p>
-                {selecionado.tipo_detectado && selecionado.tipo_detectado !== selecionado.tipo && (
-                  <p className="text-selo-danger">Tipo detectado pelo modelo: {selecionado.tipo_detectado}</p>
-                )}
-                <h4 className="pt-2 font-medium text-ink">Entidades extraídas</h4>
-                {selecionado.entidades.length === 0 ? (
-                  <p className="text-slate">Nenhuma entidade extraída.</p>
-                ) : (
-                  <ul className="divide-y divide-ink/10">
-                    {selecionado.entidades.map((e) => (
-                      <li key={e.id} className="flex items-start justify-between gap-4 py-2">
-                        <span className="font-mono text-xs text-slate">{e.chave}</span>
-                        <span className="text-right text-ink">{e.valor}</span>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-                {selecionado.entidades.length > 0 && (
-                  <p className="pt-2 font-mono text-[11px] text-slate">
-                    modelo {selecionado.entidades[0].modelo_llm} · versão {selecionado.entidades[0].versao_extracao} · confiança {Math.round(selecionado.entidades[0].confianca * 100)}%
-                  </p>
-                )}
-              </div>
-              <div>
-                <h4 className="mb-2 text-sm font-medium text-ink">Texto extraído</h4>
-                <pre className="max-h-80 overflow-auto whitespace-pre-wrap rounded-sm border border-ink/10 bg-white p-3 font-mono text-[11px] text-slate">
-                  {selecionado.texto_extraido || 'Sem texto.'}
-                </pre>
-              </div>
-            </div>
-          </Card>
-        )}
-      </main>
+      <main className="mx-auto max-w-5xl px-6 py-10"><CasoGuard>{(p) => <Conteudo {...p} />}</CasoGuard></main>
     </div>
   )
 }
